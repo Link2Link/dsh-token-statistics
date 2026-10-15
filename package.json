@@ -1,0 +1,18 @@
+{
+  "name": "dsh-token-statistics",
+  "version": "0.1.0",
+  "description": "DSH 历史 Token 统计：日历、月度趋势和按模型消耗分析",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json" },
+  "icon": "./icon.svg",
+  "files": ["index.js", "statistics.js", "history-reader.js", "client.js", "test", "cordis.patch.yml", "icon.svg", "locale", "README.md"],
+  "scripts": { "check": "node --check index.js && node --check statistics.js && node --check history-reader.js && node --check client.js", "test": "node --test test/*.test.js" },
+  "dependencies": { "zod": "^4.0.0" },
+  "peerDependencies": { "@deepseek-ai/dsh-session-format-v0-to-v1": ">=0.1.7-rc.2 <0.2.0", "@deepseek-ai/dsh-session-format-v1-to-v2": ">=0.1.7-rc.2 <0.2.0" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true, "inject": ["@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-locale"] }
+  },
+  "engines": { "node": ">=22.15" }
+}
