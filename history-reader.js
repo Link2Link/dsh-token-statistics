@@ -3,8 +3,44 @@ import { constants } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { zstdDecompress } from 'node:zlib';
 import { promisify } from 'node:util';
-import { releasedV0SessionFormatCodec, releasedV1SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v0-to-v1';
-import { releasedV2SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v1-to-v2';
+
+/** Highest physical generation this reader decodes itself; newer ones go to the official service. */
+export const MAX_GENERATION = 4;
+
+const isCodec = value => !!value && typeof value === 'object' && typeof value.createDecoder === 'function';
+
+/**
+ * Load the released physical codecs at runtime instead of a static import.
+ * A static import that misses an export fails at link time and takes the whole
+ * plugin down; a dynamic import lets the plugin fall back to the official
+ * sessionPersistence service when a future runtime moves or renames them.
+ * @param importer - module loader, injectable for tests.
+ * @returns `{ codecs }` on success, or `{ error }` describing why they are unusable.
+ */
+export async function loadSessionCodecs(importer = specifier => import(specifier)) {
+  try {
+    const [v0ToV1, v1ToV2] = await Promise.all([
+      importer('@deepseek-ai/dsh-session-format-v0-to-v1'),
+      importer('@deepseek-ai/dsh-session-format-v1-to-v2'),
+    ]);
+    const codecs = {
+      v0: v0ToV1?.releasedV0SessionFormatCodec,
+      v1: v0ToV1?.releasedV1SessionFormatCodec,
+      v2: v1ToV2?.releasedV2SessionFormatCodec,
+    };
+    const missing = Object.keys(codecs).filter(key => !isCodec(codecs[key]));
+    if (missing.length) return { error: new Error(`Released session codecs unavailable: ${missing.join(', ')}`) };
+    return { codecs: Object.freeze(codecs) };
+  } catch (error) {
+    return { error };
+  }
+}
+
+const loaded = await loadSessionCodecs();
+/** Codecs resolved at module load, or undefined when this runtime cannot provide them. */
+export const sessionCodecs = loaded.codecs;
+/** Why {@link sessionCodecs} is undefined; undefined when the codecs loaded. */
+export const sessionCodecsError = loaded.error;
 
 const decompress = promisify(zstdDecompress);
 const MAX_FRAME = 128 * 1024 * 1024;
@@ -107,15 +143,18 @@ async function* rows(file, compressed, signal) {
   if (pending.length) throw new Error('Torn JSONL tail; usage excluded (history is not repaired)');
 }
 
-function codecFor(header, generation) {
+function codecFor(codecs, header, generation) {
   if (header?.version !== generation) throw new Error('Session generation and header disagree');
-  if (generation === 0) return releasedV0SessionFormatCodec.createDecoder(header, 'strict');
-  if (generation === 1) return releasedV1SessionFormatCodec.createDecoder(header, 'strict');
+  if (generation === 0) return codecs.v0.createDecoder(header, 'strict');
+  if (generation === 1) return codecs.v1.createDecoder(header, 'strict');
   // V3 and V4 retain V2 physical envelopes. Their additional migrations only
   // validate/rewrite unrelated payload vocabulary, not usage or sequence numbers.
-  if (generation >= 2 && generation <= 4) return releasedV2SessionFormatCodec.createDecoder({ ...header, version: 2 }, 'strict');
+  if (generation >= 2 && generation <= MAX_GENERATION) return codecs.v2.createDecoder({ ...header, version: 2 }, 'strict');
   throw new Error(`Unsupported session generation ${generation}`);
 }
+
+/** Session id from its storage directory name (the JSONL backend's `~XXXX` segment encoding). */
+const decodeSessionDir = name => name.replace(/~([0-9A-F]{4})/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
 
 function minimalUsage(value, legacy) {
   if (!value || typeof value !== 'object') return undefined;
@@ -203,9 +242,17 @@ function extractor(legacy) {
   };
 }
 
-/** READ-ONLY physical history adapter. It never migrates, repairs or writes logs. */
-export function createHistoricalReader(root) {
+/**
+ * READ-ONLY physical history adapter. It never migrates, repairs or writes logs.
+ * @param root - absolute JSONL session root.
+ * @param options.codecs - released physical codecs (defaults to the ones loaded at module load).
+ * @param options.fallback - official sessionPersistence service; sessions written in a
+ *   generation newer than {@link MAX_GENERATION} are listed by directory id and opened
+ *   through it instead of failing. Its `read` access never publishes migrations.
+ */
+export function createHistoricalReader(root, { codecs = sessionCodecs, fallback } = {}) {
   if (typeof root !== 'string' || !root) throw new TypeError('Explicit session JSONL root is required');
+  if (!codecs) throw new TypeError('Released session codecs are required for the physical history reader');
   root = resolve(root);
   const headers = new Map();
   let selected = new Map();
@@ -254,12 +301,17 @@ export function createHistoricalReader(root) {
           entry.revision = fingerprint(stat);
           paths.add(entry.path);
           let header = headers.get(entry.path);
-          if (header?.revision !== entry.revision) {
+          if (entry.generation > MAX_GENERATION && fallback) {
+            // Written by a newer runtime than this reader knows: do not guess at its
+            // physical envelope. The official service owns that format.
+            header = { revision: entry.revision, header: { id: decodeSessionDir(session.name) }, delegated: true };
+            headers.set(entry.path, header);
+          } else if (header?.revision !== entry.revision) {
             let file;
             try {
               file = await safeOpen(entry, signal);
               for await (const row of rows(file, entry.compressed, signal)) {
-                header = { revision: entry.revision, header: { ...codecFor(row, entry.generation).header, version: entry.generation } };
+                header = { revision: entry.revision, header: { ...codecFor(codecs, row, entry.generation).header, version: entry.generation } };
                 break;
               }
               if (!header || header.revision !== entry.revision) throw new Error('Missing session header');
@@ -268,13 +320,13 @@ export function createHistoricalReader(root) {
               check(signal);
               // Keep corrupt files visible as failed sessions rather than silently
               // shrinking coverage. The directory is the encoded session id.
-              header = { revision: entry.revision, header: { id: session.name.replace(/~([0-9A-F]{4})/g, (_, code) => String.fromCharCode(parseInt(code, 16))) }, error };
+              header = { revision: entry.revision, header: { id: decodeSessionDir(session.name) }, error };
               headers.set(entry.path, header);
             } finally { if (file) await file.close(); }
           }
           const id = header.header.id;
           if (next.has(id)) throw new Error(`Duplicate historical session id ${id}`);
-          next.set(id, { ...entry, header: header.header, error: header.error });
+          next.set(id, { ...entry, header: header.header, error: header.error, delegated: header.delegated });
           snapshots.push({ header: header.header, revision: entry.revision, sizeBytes: Number(stat.size) });
         }
       }
@@ -289,13 +341,14 @@ export function createHistoricalReader(root) {
       const entry = selected.get(id);
       if (!entry) throw new Error('Historical session not listed');
       if (entry.error) throw entry.error;
+      if (entry.delegated) return fallback.open(id, 'read', { signal });
       const file = await safeOpen(entry, signal);
       let decoder;
       const extract = extractor(entry.generation < 2);
       let inherited;
       try {
         for await (const row of rows(file, entry.compressed, signal)) {
-          if (!decoder) decoder = codecFor(row, entry.generation);
+          if (!decoder) decoder = codecFor(codecs, row, entry.generation);
           else decoder.decodeRow(row, extract);
         }
         if (!decoder) throw new Error('Missing session header');

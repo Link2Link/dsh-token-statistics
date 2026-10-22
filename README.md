@@ -24,6 +24,8 @@ DSH Web 历史 Token 统计插件。左侧栏的新会话按钮下、插件入�
 
 本目录是可直接安装的 ESM bundle，不需要编译。依赖 `zod`，历史物理 codec 由兼容范围内的 DSH runtime 提供，React 由 Harness 提供。
 
+兼容性：`engines.dsh`（`>=0.1.7-rc.2 <1.0.0-0`）单独决定 DSH 启动时的兼容检查，`peerDependencies` 不再参与。codec 改为运行时动态加载：若新版 runtime 移除或改名这些导出，插件改走 `sessionPersistence` 服务，不会加载失败；高于 v4 的未知会话代际逐个交给官方服务以只读方式打开。
+
 ```sh
 npm install --ignore-scripts
 npm run check

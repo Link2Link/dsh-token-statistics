@@ -1,5 +1,5 @@
 import { createCollector, projectionDefinition } from './statistics.js';
-import { createHistoricalReader } from './history-reader.js';
+import { createHistoricalReader, sessionCodecs, sessionCodecsError } from './history-reader.js';
 import { isAbsolute } from 'node:path';
 
 export const name = 'dsh-token-statistics';
@@ -20,7 +20,15 @@ export function apply(ctx) {
     // Concrete JSONL Config is public in its shipped declaration. Other storage
     // implementations retain the abstract handle-based service path.
     const root = storage.name === 'session-persistence-jsonl' ? storage.config?.root : undefined;
-    const history = typeof root === 'string' && isAbsolute(root) ? createHistoricalReader(root) : storage;
+    const jsonlRoot = typeof root === 'string' && isAbsolute(root) ? root : undefined;
+    // Fast physical reader when this runtime still ships the released codecs;
+    // otherwise (or for generations it does not know) the official service.
+    const history = jsonlRoot && sessionCodecs
+      ? createHistoricalReader(jsonlRoot, { codecs: sessionCodecs, fallback: storage })
+      : storage;
+    if (jsonlRoot && !sessionCodecs) {
+      ctx.logger?.warn?.('released session codecs unavailable (%s); reading history through sessionPersistence', String(sessionCodecsError?.message ?? sessionCodecsError));
+    }
     const collector = createCollector({
       sessionPersistence: history,
       sessions: ctx.sessions,

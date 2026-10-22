@@ -41,9 +41,23 @@ window.__ModuleLoader__.load({
       for (const row of rows) for (const key of fields) out[key] += Number(row[key]) || 0;
       return out;
     }
-    function compact(n) { return n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); }
+    // K/M/B/T with three significant digits and no trailing zeros: 1.17B, 221M, 79.6K, 950.
+    // Rounding may promote a unit (999,950 → 1M, never "1000K"). Exact values stay in titles.
+    const UNITS = [[1e3,'K'],[1e6,'M'],[1e9,'B'],[1e12,'T']];
+    function compact(n) {
+      n = Math.round(Number(n));
+      if (!Number.isFinite(n) || n <= 0) return '0';
+      if (n < 1e3) return String(n);
+      let i = UNITS.length - 1;
+      while (i > 0 && n < UNITS[i][0]) i--;
+      const scaled = n / UNITS[i][0];
+      const rounded = Number(scaled.toFixed(scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2));
+      if (rounded >= 1000 && i < UNITS.length - 1) return '1' + UNITS[i + 1][1];
+      return rounded + UNITS[i][1];
+    }
     function Icon({size = 20}) {
-      return h('svg', {width:size,height:size,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:1.6,strokeLinecap:'round',strokeLinejoin:'round','aria-hidden':true},
+      // data-ts-panel marks the sidebar row this glyph renders into (see the toggle effect).
+      return h('svg', {width:size,height:size,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:1.6,strokeLinecap:'round',strokeLinejoin:'round','aria-hidden':true,'data-ts-panel':''},
         h('rect',{x:3,y:5,width:18,height:16,rx:3}),h('path',{d:'M3 10h18M8 3v4M16 3v4M8 17v-3M12 17v-5M16 17v-1'}));
     }
     return {
@@ -77,11 +91,13 @@ window.__ModuleLoader__.load({
             return () => controller.abort();
           }, [revision, zone]);
           const number = n => Number(n || 0).toLocaleString(lang);
-          const metric = (row, key, short = false) => {
+          // Display uses K/M/B; `exact` gives the full grouped value for titles. Unreported
+          // optional fields stay "—" in both, never a misleading 0.
+          const metric = (row, key, exact = false) => {
             const reported = row[key + 'Reported'];
             const optional = ['cacheRead','cacheWrite','reasoning'].includes(key);
             if (optional && !reported) return '—';
-            return (short ? compact(row[key] || 0) : number(row[key])) + (optional && reported < row.requests ? ' *' : '');
+            return (exact ? number(row[key]) : compact(row[key])) + (optional && reported < row.requests ? ' *' : '');
           };
           const year = Number(period.slice(0,4)), month = Number(period.slice(5));
           const periodLabel = mode === 'year' ? String(year) : new Date(year,month-1,1).toLocaleDateString(lang,{year:'numeric',month:'long'});
@@ -102,16 +118,16 @@ window.__ModuleLoader__.load({
             setPeriod(`${next.getFullYear()}-${String(next.getMonth()+1).padStart(2,'0')}`); setSelected(null);
           }
           const button = (text,onClick,extra={}) => h('button',{type:'button',className:'ts-btn',onClick,...extra},text);
-          const detailItem = (key,value) => h('div',{key},h('span',{className:'ts-muted ts-small'},t(key)),h('strong',null,value));
+          const detailItem = (key,row) => h('div',{key},h('span',{className:'ts-muted ts-small'},t(key)),h('strong',{title:metric(row,key,true)},metric(row,key)));
           function modelTable() {
             if (!models.length) return h('div',{className:'ts-empty'},t('empty'));
             return h('div',{className:'ts-table-wrap'},h('table',{className:'ts-table'},
               h('thead',null,h('tr',null,...['model','input','output','cacheRead','total','share','requests'].map(k => h('th',{key:k,scope:'col'},t(k))))),
               h('tbody',null,...models.map(m => h('tr',{key:m.key},
                 h('td',null,h('div',{className:'ts-model-name'},m.model),h('div',{className:'ts-muted ts-small'},m.provider)),
-                ...['input','output','cacheRead','total'].map(k => h('td',{key:k,title:number(m[k])},metric(m,k))),
+                ...['input','output','cacheRead','total'].map(k => h('td',{key:k,title:metric(m,k,true)},metric(m,k))),
                 h('td',null,h('div',null,detail.total ? (m.total/detail.total*100).toFixed(1)+'%' : '—'),h('div',{className:'ts-share'},h('span',{style:{width:(detail.total ? m.total/detail.total*100 : 0)+'%'}}))),
-                h('td',null,number(m.requests),m.missingUsage > 0 && h('div',{className:'ts-muted ts-small'},`${number(m.missingUsage)} ${t('noUsage')}`))
+                h('td',{title:number(m.requests)},compact(m.requests),m.missingUsage > 0 && h('div',{className:'ts-muted ts-small'},`${number(m.missingUsage)} ${t('noUsage')}`))
               )))
             ));
           }
@@ -148,15 +164,31 @@ window.__ModuleLoader__.load({
               data.coverage.reportedMinimum > 0 && h('div',{className:'ts-note ts-warning'},`${number(data.coverage.reportedMinimum)} ${t('minimum')}`),
               data.coverage.partialBreakdown > 0 && h('p',{className:'ts-muted ts-small'},t('partial')),
               h('section',{className:'ts-kpis'},
-                ...[['total',total.total,`${number(total.requests)} ${t('requests')}`],['input',total.input,`${t('cacheRead')}: ${metric(total,'cacheRead',true)}`],['output',total.output,`${t('reasoning')}: ${metric(total,'reasoning',true)}`],['activeDays',activeDays,`${t('peak')}: ${compact(peak)}`]].map(([label,value,sub])=>h('div',{className:'ts-card ts-kpi',key:label},h('span',{className:'ts-muted'},t(label)),h('strong',{title:number(value)},label==='activeDays'?number(value):compact(value)),h('span',{className:'ts-muted ts-small'},sub)))),
+                ...[['total',total.total,`${compact(total.requests)} ${t('requests')}`,`${number(total.requests)} ${t('requests')}`],['input',total.input,`${t('cacheRead')}: ${metric(total,'cacheRead')}`,`${t('cacheRead')}: ${metric(total,'cacheRead',true)}`],['output',total.output,`${t('reasoning')}: ${metric(total,'reasoning')}`,`${t('reasoning')}: ${metric(total,'reasoning',true)}`],['activeDays',activeDays,`${t('peak')}: ${compact(peak)}`,`${t('peak')}: ${number(peak)}`]].map(([label,value,sub,subTitle])=>h('div',{className:'ts-card ts-kpi',key:label},h('span',{className:'ts-muted'},t(label)),h('strong',{title:number(value)},label==='activeDays'?number(value):compact(value)),h('span',{className:'ts-muted ts-small',title:subTitle},sub)))),
               mode === 'month' ? calendar() : chart(),
               h('section',{className:'ts-card'},h('div',{className:'ts-row'},h('h2',null,selected && mode==='month' ? `${selected} · ${t('dayModels')}` : t(mode==='month'?'monthSummary':'yearSummary')),selected && mode==='month' && button(t('clearDay'),()=>setSelected(null))),
-                h('div',{className:'ts-details'},...['total','input','output','cacheRead','cacheWrite','reasoning'].map(k=>detailItem(k,metric(detail,k)))),modelTable()),
+                h('div',{className:'ts-details'},...['total','input','output','cacheRead','cacheWrite','reasoning'].map(k=>detailItem(k,detail))),modelTable()),
               h('footer',{className:'ts-footer'},h('span',null,`${t('coverage')}: ${number(data.coverage.sessions)}`),h('span',null,`${t('timezone')}: ${data.timeZone}`),h('span',null,`${t('updated')}: ${new Date(data.generatedAt).toLocaleString(lang)}`))
             ),
             h('details',{className:'ts-note ts-rules'},h('summary',null,t('rules')),h('p',null,t('rulesText')))
           ));
         }
+        // Toggle: the sidebar row always calls layout.selectPanel(id), which only opens.
+        // A second click on our row while the panel is open closes it instead. The
+        // capture-phase listener runs before React's root listener, so stopping the
+        // event here suppresses the row's own selectPanel(id) re-open.
+        ctx.effect(() => {
+          const onClick = event => {
+            const row = event.target instanceof Element ? event.target.closest('button') : null;
+            if (!row || !row.querySelector('svg[data-ts-panel]')) return;
+            if (ctx.layout.panelInfo?.getSnapshot?.().activePanelId !== NS) return;
+            event.preventDefault();
+            event.stopPropagation();
+            ctx.layout.selectPanel(null);
+          };
+          document.addEventListener('click', onClick, true);
+          return () => document.removeEventListener('click', onClick, true);
+        });
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({name:'sidebar.panellist',id:NS,order:-10,label:()=>t('title'),locale:NS},Icon));
         ctx.slots.inject('main', () => ctx.slots.register({name:'main',key:NS,locale:NS},Page));
       },
